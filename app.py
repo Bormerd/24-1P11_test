@@ -1,167 +1,177 @@
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Union
-
+from typing import Annotated, Optional
+import enum
+import logging
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import (
+    Depends, 
+    FastAPI, 
+    HTTPException, 
+    status
+)
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jwt.exceptions import InvalidTokenError
 from passlib.context import CryptContext
 from pydantic import BaseModel
-from models import User
+import models as m
 
-# Константы для JWT (JSON Web Token)
-SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"  # Секретный ключ для подписи токенов
-ALGORITHM = "HS256"  # Алгоритм шифрования для JWT
-ACCESS_TOKEN_EXPIRE_MINUTES = 30  # Время жизни токена в минутах
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Модель для возврата токена
+SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+class UserRole(str, enum.Enum):
+    STUDENT = "student"
+    TEACHER = "teacher"
+
 class Token(BaseModel):
-    access_token: str  # Токен доступа
-    token_type: str  # Тип токена (обычно "bearer")
+    access_token: str
+    token_type: str
+    role: UserRole
 
-# Модель для данных, хранящихся в токене
 class TokenData(BaseModel):
-    username: str | None = None  # Имя пользователя, хранящееся в токене
+    username: str
+    role: UserRole
 
-class BaseUser(BaseModel):
-    username: str  # Имя пользователя (обязательное поле)
-    email: str | None = None  # Электронная почта пользователя (необязательное поле)
-    full_name: str | None = None  # Полное имя пользователя (необязательное поле)
-    disabled: bool | None = None  # Флаг, указывающий, отключен ли пользователь (необязательное поле)
-# Модель для пользователя в базе данных (наследуется от UserD)
+class User(BaseModel):
+    username: str
+    email: str
+    full_name: str
+    disabled: bool
+    role: UserRole
 
-# Модель для данных пользователя
-class UserD(BaseUser):
-    password: str # Пароль пользователя
-    
-class UserInDB(BaseUser):
-    hashed_password: str  # Хешированный пароль пользователя
+class UserInDB(User):
+    hashed_password: str
 
-# Контекст для хеширования паролей
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    full_name: str
+    password: str
+    role: UserRole = UserRole.STUDENT
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Схема OAuth2 для аутентификации через токен
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# Создание экземпляра FastAPI
 app = FastAPI()
 
-# Функция для проверки пароля
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)  # Сравнение введенного пароля с хешированным
+@app.on_event("startup")
+def startup():
+    try:
+        with m.db:
+            m.db.create_tables([m.User])
+        logger.info("Database tables created successfully")
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+        raise
 
-# Функция для хеширования пароля
-def get_password_hash(password):
-    return pwd_context.hash(password)  # Возвращает хешированный пароль
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
-# Функция для получения пользователя из базы данных по имени
-def get_user(username: str):
-    user = User.get_or_none(username=username)  # Поиск пользователя в базе данных
-    if user:
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def get_db_user(username: str) -> Optional[m.User]:
+    try:
+        return m.User.get(m.User.username == username)
+    except m.User.DoesNotExist:
+        return None
+
+def get_user(username: str) -> Optional[UserInDB]:
+    db_user = get_db_user(username)
+    if db_user:
         return UserInDB(
-            username=user.username,
-            email=user.email,
-            full_name=user.full_name,
-            disabled=user.disabled,
-            hashed_password=user.hashed_password,
-        )  # Возвращает данные пользователя, если он найден
+            username=db_user.username,
+            email=db_user.email,
+            full_name=db_user.full_name,
+            disabled=db_user.disabled,
+            role=UserRole(db_user.role),
+            hashed_password=db_user.hashed_password
+        )
+    return None
 
-# Функция для аутентификации пользователя
-def authenticate_user(username: str, password: str) -> Union[UserInDB, bool]:
-    user = get_user(username)  # Получаем пользователя по имени
-    if not user:
-        return False  # Если пользователь не найден, возвращаем False
-    if not verify_password(password, user.hashed_password):
-        return False  # Если пароль неверный, возвращаем False
-    return user  # Возвращаем пользователя, если аутентификация успешна
+def authenticate_user(username: str, password: str) -> Optional[UserInDB]:
+    user = get_user(username)
+    if not user or not verify_password(password, user.hashed_password):
+        return None
+    if user.disabled:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return user
 
-# Функция для создания токена доступа
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
-    to_encode = data.copy()  # Копируем данные для кодирования
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta  # Устанавливаем срок действия токена
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=15)  # По умолчанию токен действует 15 минут
-    to_encode.update({"exp": expire})  # Добавляем срок действия в данные
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)  # Кодируем данные в JWT
-    return encoded_jwt  # Возвращаем закодированный токен
+def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# Функция для получения текущего пользователя по токену
-async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserInDB:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
-    )  # Исключение, если токен недействителен
+    )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])  # Декодируем токен
-        username: str = payload.get("sub")  # Получаем имя пользователя из токена
-        if username is None:
-            raise credentials_exception  # Если имя пользователя отсутствует, выбрасываем исключение
-        token_data = TokenData(username=username)  # Создаем объект TokenData
-    except jwt.ExpiredSignatureError:
-        raise credentials_exception  # Если срок действия токена истек, выбрасываем исключение
-    except jwt.InvalidTokenError:
-        raise credentials_exception  # Если токен недействителен, выбрасываем исключение
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        role: str = payload.get("role")
+        if not username or not role:
+            raise credentials_exception
+        token_data = TokenData(username=username, role=UserRole(role))
+    except (InvalidTokenError, ValueError) as e:
+        logger.error(f"JWT Error: {e}")
+        raise credentials_exception
+    
+    user = get_user(username=token_data.username)
+    if not user or user.role != token_data.role:
+        raise credentials_exception
+    return user
 
-    user = get_user(username=token_data.username)  # Получаем пользователя по имени из токена
-    if user is None:
-        raise credentials_exception  # Если пользователь не найден, выбрасываем исключение
-    return user  # Возвращаем пользователя
-
-# Функция для получения текущего активного пользователя
-async def get_current_active_user(
-    current_user: Annotated[UserD, Depends(get_current_user)],
-):
-    if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")  # Если пользователь отключен, выбрасываем исключение
-    return current_user  # Возвращаем текущего активного пользователя
-
-# Эндпоинт для получения токена доступа
-@app.post("/token")
-async def login_for_access_token(
-    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-) -> Token:
-    user = authenticate_user(form_data.username, form_data.password)  # Аутентифицируем пользователя
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
     if not user:
+        logger.warning(f"Failed login attempt for username: {form_data.username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
-        )  # Если аутентификация не удалась, выбрасываем исключение
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # Устанавливаем срок действия токена
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )  # Создаем токен доступа
-    return {"access_token": access_token, "token_type": "bearer"}  # Возвращаем токен
-
-# Эндпоинт для получения данных текущего пользователя
-@app.get("/users/me/", response_model=UserD)
-async def read_users_me(
-    current_user: Annotated[UserD, Depends(get_current_active_user)],
-):
-    return current_user  # Возвращаем данные текущего пользователя
-
-# Эндпоинт для регистрации нового пользователя
-@app.post("/register/")
-async def register(user: UserD):
-    # Проверяем, существует ли пользователь с таким именем
-    existing_user = User.get_or_none(username=user.username)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username already registered",
-        )  # Если пользователь уже существует, выбрасываем исключение
-
-    # Хешируем пароль перед сохранением
-    hashed_password = get_password_hash(user.password)
-
-    # Создаем нового пользователя
-    new_user = User.create(
-        username=user.username,
-        email=user.email,
-        full_name=user.full_name,
-        hashed_password=hashed_password,
-        disabled=False  # По умолчанию пользователь активен
+        data={"sub": user.username, "role": user.role.value},
+        expires_delta=access_token_expires
     )
-    return {"message": "User registered successfully", "username": new_user.username}  # Возвращаем сообщение об успешной регистрации
+    return Token(access_token=access_token, token_type="bearer", role=user.role)
+
+@app.post("/register", response_model=User)
+async def register_user(user_data: UserCreate):
+    if get_db_user(user_data.username):
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    hashed_password = get_password_hash(user_data.password)
+    try:
+        user = m.User.create(
+            username=user_data.username,
+            email=user_data.email,
+            full_name=user_data.full_name,
+            hashed_password=hashed_password,
+            disabled=False,
+            role=user_data.role.value
+        )
+        logger.info(f"User {user_data.username} registered successfully")
+        return User(
+            username=user.username,
+            email=user.email,
+            full_name=user.full_name,
+            disabled=user.disabled,
+            role=UserRole(user.role)
+        )
+    except Exception as e:
+        logger.error(f"Error registering user {user_data.username}: {e}")
+        raise HTTPException(status_code=500, detail="Error creating user")
+
+@app.get("/users/me", response_model=User)
+async def read_users_me(current_user: UserInDB = Depends(get_current_user)):
+    return current_user

@@ -1,8 +1,8 @@
 fastapi
 uvicorn
-pyjwt
 passlib
-python-multipart
 bcrypt
+python-jose
 peewee
-sqlalchemy
+python-multipart
+pyjwt

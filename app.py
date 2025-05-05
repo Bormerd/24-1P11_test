@@ -56,16 +56,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 app = FastAPI()
 
-@app.on_event("startup")
-def startup():
-    try:
-        with m.db:
-            m.db.create_tables([m.User])
-        logger.info("Database tables created successfully")
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
-        raise
-
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
